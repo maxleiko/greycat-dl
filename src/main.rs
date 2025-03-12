@@ -47,8 +47,6 @@ fn main() -> Result<()> {
     env_logger::init();
     dotenv().ok();
 
-    let width = termsize::get().map(|s| s.cols as usize).unwrap_or(0);
-
     let args = Args::parse();
 
     let token = if let (Some(username), Some(password)) = (args.username, args.password) {
@@ -75,7 +73,6 @@ fn main() -> Result<()> {
         &files_root,
         "",
         &mut files,
-        width,
     )?;
     print!("{MOVE_CURSOR_UP}{CLEAR_LINE}");
     println!("Found {} files to download...\n", files.len());
@@ -111,14 +108,13 @@ fn visit_dir(
     root: &str,
     dirpath: &str,
     files: &mut Vec<Entry>,
-    _w: usize,
 ) -> Result<()> {
     let url = format!("{root}{dirpath}");
     let mut res = ureq::get(&url).call()?;
     let entries: Vec<File> = res.body_mut().read_json()?;
     for entry in entries {
         if entry.path.ends_with('/') {
-            visit_dir(outdir, root, &entry.path, files, _w)?;
+            visit_dir(outdir, root, &entry.path, files)?;
         } else {
             let url = format!("{root}{}", entry.path);
             let filepath = format!("{outdir}/{}", entry.path);
