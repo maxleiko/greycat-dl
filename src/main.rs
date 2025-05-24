@@ -11,6 +11,7 @@ use dotenvy::dotenv;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use human_bytes::human_bytes;
 
 const MOVE_CURSOR_UP: &str = "\x1B[1A";
 const CLEAR_LINE: &str = "\x1B[2K";
@@ -30,17 +31,25 @@ struct Args {
     username: Option<String>,
     #[clap(long, help = "GreyCat user password to connect with", env = "PASSWORD")]
     password: Option<String>,
+    #[clap(
+        long,
+        help = "Won't actually download the files, just print stats",
+        default_value = "false"
+    )]
+    dry_run: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct File {
     path: String,
+    size: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
 struct Entry {
     url: String,
     filepath: PathBuf,
+    size: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -68,23 +77,25 @@ fn main() -> Result<()> {
 
     let mut files = Vec::with_capacity(1024);
     println!("Listing files from {files_root}\n");
-    visit_dir(
-        &args.outdir.to_string_lossy(),
-        &files_root,
-        "",
-        &mut files,
-    )?;
+    visit_dir(&args.outdir.to_string_lossy(), &files_root, "", &mut files)?;
+    let total_files = files.len();
     print!("{MOVE_CURSOR_UP}{CLEAR_LINE}");
-    println!("Found {} files to download...\n", files.len());
-    let total = files.len();
-    let remaining = AtomicUsize::new(files.len());
+
+    if args.dry_run {
+        let total_size = files.iter().fold(0, |acc, f| acc + f.size.unwrap_or(0));
+        println!("Found {total_files} files to download which account for {}", human_bytes(total_size as f64));
+        return Ok(());
+    }
+
+    println!("Found {} files to download...\n", total_files);
+    let remaining = AtomicUsize::new(total_files);
     files
         .par_iter()
         .for_each(|entry| match download_file(entry, token.as_deref()) {
             Ok(_) => {
                 let n = remaining.fetch_sub(1, Ordering::Relaxed) - 1;
                 println!(
-                    "{MOVE_CURSOR_UP}{CLEAR_LINE}{n:6}/{total} {}",
+                    "{MOVE_CURSOR_UP}{CLEAR_LINE}{n:6}/{total_files} {}",
                     entry.filepath.to_string_lossy()
                 );
             }
@@ -98,17 +109,12 @@ fn main() -> Result<()> {
         });
 
     print!("{MOVE_CURSOR_UP}{CLEAR_LINE}");
-    println!("Downloaded {} files", files.len());
+    println!("Downloaded {} files", total_files);
 
     Ok(())
 }
 
-fn visit_dir(
-    outdir: &str,
-    root: &str,
-    dirpath: &str,
-    files: &mut Vec<Entry>,
-) -> Result<()> {
+fn visit_dir(outdir: &str, root: &str, dirpath: &str, files: &mut Vec<Entry>) -> Result<()> {
     let url = format!("{root}{dirpath}");
     let mut res = ureq::get(&url).call()?;
     let entries: Vec<File> = res.body_mut().read_json()?;
@@ -122,7 +128,11 @@ fn visit_dir(
             print!("{MOVE_CURSOR_UP}{CLEAR_LINE}");
             println!("{n:6} {filepath}");
             let filepath = PathBuf::from(filepath);
-            files.push(Entry { url, filepath });
+            files.push(Entry {
+                url,
+                filepath,
+                size: entry.size,
+            });
         }
     }
     Ok(())
@@ -151,8 +161,7 @@ fn get_token(url: &str, username: &str, password: &str) -> Result<String> {
     let encoded = STANDARD_NO_PAD.encode(credentials);
 
     let token = ureq::post(&format!("{url}runtime::User::login"))
-        .header("content-type", "application/json")
-        .send(serde_json::to_vec(&serde_json::json!([encoded, false]))?)
+        .send_json(serde_json::json!([encoded, false]))
         .context("failed to send request")?
         .body_mut()
         .read_json::<String>()
