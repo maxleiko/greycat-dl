@@ -1,17 +1,22 @@
 use std::{
     io::BufWriter,
     path::PathBuf,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Sender},
+        Arc,
+    },
+    thread,
 };
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use clap::Parser;
 use dotenvy::dotenv;
+use human_bytes::human_bytes;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use human_bytes::human_bytes;
 
 const MOVE_CURSOR_UP: &str = "\x1B[1A";
 const CLEAR_LINE: &str = "\x1B[2K";
@@ -74,16 +79,41 @@ fn main() -> Result<()> {
     } else {
         format!("{}/files/", args.url)
     };
+    let files_root = Arc::new(files_root);
+    let outdir = args.outdir.to_string_lossy();
 
     let mut files = Vec::with_capacity(1024);
+
+    let (tx, rx) = mpsc::channel();
+
     println!("Listing files from {files_root}\n");
-    visit_dir(&args.outdir.to_string_lossy(), &files_root, "", &mut files)?;
+    let files_root_clone = Arc::clone(&files_root);
+    thread::spawn(move || {
+        visit_dir(files_root_clone, "", 0, tx.clone()).expect("les problemes");
+    });
+
+    rx.iter().for_each(|file| {
+        let url = format!("{files_root}{}", file.path);
+        let filepath = format!("{outdir}/{}", file.path);
+        let n = files.len() + 1;
+        print!("{MOVE_CURSOR_UP}{CLEAR_LINE}");
+        println!("{n:6} {filepath}");
+        let filepath = PathBuf::from(filepath);
+        files.push(Entry {
+            url,
+            filepath,
+            size: file.size,
+        });
+    });
+
     let total_files = files.len();
-    print!("{MOVE_CURSOR_UP}{CLEAR_LINE}");
 
     if args.dry_run {
         let total_size = files.iter().fold(0, |acc, f| acc + f.size.unwrap_or(0));
-        println!("Found {total_files} files to download which account for {}", human_bytes(total_size as f64));
+        println!(
+            "Found {total_files} files to download which account for {}",
+            human_bytes(total_size as f64)
+        );
         return Ok(());
     }
 
@@ -114,25 +144,23 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn visit_dir(outdir: &str, root: &str, dirpath: &str, files: &mut Vec<Entry>) -> Result<()> {
+fn visit_dir(root: Arc<String>, dirpath: &str, depth: usize, tx: Sender<File>) -> Result<()> {
     let url = format!("{root}{dirpath}");
     let mut res = ureq::get(&url).call()?;
     let entries: Vec<File> = res.body_mut().read_json()?;
-    for entry in entries {
-        if entry.path.ends_with('/') {
-            visit_dir(outdir, root, &entry.path, files)?;
+    for file in entries {
+        let tx = tx.clone();
+        if file.path.ends_with('/') {
+            let root = Arc::clone(&root);
+            if depth == 0 {
+                thread::spawn(move || {
+                    visit_dir(root, &file.path, depth + 1, tx).expect("les problemes");
+                });
+            } else {
+                visit_dir(root, &file.path, depth + 1, tx)?;
+            }
         } else {
-            let url = format!("{root}{}", entry.path);
-            let filepath = format!("{outdir}/{}", entry.path);
-            let n = files.len();
-            print!("{MOVE_CURSOR_UP}{CLEAR_LINE}");
-            println!("{n:6} {filepath}");
-            let filepath = PathBuf::from(filepath);
-            files.push(Entry {
-                url,
-                filepath,
-                size: entry.size,
-            });
+            tx.send(file)?;
         }
     }
     Ok(())
